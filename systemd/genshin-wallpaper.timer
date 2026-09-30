@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Genshin Wallpaper Updater periodically
+
+[Timer]
+# ユーザーがログインしてsystemdが起動したら30秒後に初回実行
+OnStartupSec=30
+# 前回実行から1時間ごとに実行
+OnUnitActiveSec=1h
+# システムがオフの間に逃した実行は、起動時にまとめて実行
+Persistent=true
+
+[Install]
+WantedBy=timers.target

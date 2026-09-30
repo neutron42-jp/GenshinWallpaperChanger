@@ -1,0 +1,7 @@
+[Unit]
+Description=Genshin Impact Wallpaper Updater
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/genshin-wallpaper.sh
