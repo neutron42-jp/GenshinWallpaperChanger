@@ -194,8 +194,22 @@ apply_wallpaper() {
 
     # GNOME (light / dark 両方)
     if command -v gsettings &>/dev/null; then
-        gsettings set org.gnome.desktop.background picture-uri "file://${img}"
-        gsettings set org.gnome.desktop.background picture-uri-dark "file://${img}"
+        local uri="file://${img}"
+        local current
+        current=$(gsettings get org.gnome.desktop.background picture-uri | tr -d "'")
+        # 同じ URI のままファイルだけ差し替えても GNOME は再読み込みしないことがある。
+        # 現在値と同じ場合は別の画像を一度挟んで変更を通知させる (表示は一瞬で戻る)
+        if [[ "$current" == "$uri" ]]; then
+            local alt="${CURRENT_IMG}"
+            [[ "$img" == "$CURRENT_IMG" ]] && alt="${CURRENT_UPSCALED}"
+            if [[ -f "$alt" ]]; then
+                gsettings set org.gnome.desktop.background picture-uri "file://${alt}"
+                gsettings set org.gnome.desktop.background picture-uri-dark "file://${alt}"
+            fi
+        fi
+        gsettings set org.gnome.desktop.background picture-uri "$uri"
+        gsettings set org.gnome.desktop.background picture-uri-dark "$uri"
+        echo "GNOME: 壁紙を適用しました (${img})"
     fi
 
     # Hyprland (Ambxst)
