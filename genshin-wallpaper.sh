@@ -12,6 +12,7 @@ set -euo pipefail
 
 FORCE=""
 UPSCALE_ONLY=""
+APPLY_ONLY=""
 
 # 引数解析
 for arg in "$@"; do
@@ -21,6 +22,9 @@ for arg in "$@"; do
             ;;
         --upscale-only)
             UPSCALE_ONLY="1"
+            ;;
+        --apply-only)
+            APPLY_ONLY="1"
             ;;
     esac
 done
@@ -38,6 +42,11 @@ TEMP_UPSCALED="${WALLPAPER_DIR}/temp_upscaled.webp"
 REALESRGAN_DIR="${WALLPAPER_DIR}/realesrgan"
 REALESRGAN_BIN="${REALESRGAN_DIR}/realesrgan-ncnn-vulkan"
 REALESRGAN_URL="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip"
+
+# 超解像に使う Vulkan デバイス番号 (0: NVIDIA dGPU / 1: AMD iGPU / 2: llvmpipe)
+# dGPU では Xid 109 (CTX SWITCH TIMEOUT) で全タイルが失敗し、
+# 全透明の WebP が出力される事故が起きたため、既定は iGPU。
+REALESRGAN_GPU="${REALESRGAN_GPU:-1}"
 
 # HoYoPlay API: getGames → 文字なし（pure）背景画像
 API_URL="https://sg-hyp-api.hoyoverse.com/hyp/hyp-connect/api/getGames?launcher_id=VYTpXlbWo8&language=ja-jp"
@@ -126,6 +135,108 @@ if [[ ! -f "$REALESRGAN_BIN" ]]; then
     download_realesrgan
 fi
 
+# --- 画像チェック ---
+# Real-ESRGAN は Vulkan の処理に失敗しても終了コード 0 で
+# 全透明 (ほぼ空) の WebP を書き出すことがある。
+# それを壁紙に設定すると GNOME は背景色だけを表示してしまうので、ここで弾く。
+image_ok() {
+    local img="$1" src="${2:-}"
+
+    [[ -f "$img" && -s "$img" ]] || return 1
+
+    # 正常な 2x 超解像なら元画像より十分大きくなる
+    if [[ -n "$src" && -f "$src" ]]; then
+        local src_size dst_size
+        src_size=$(stat -c%s "$src")
+        dst_size=$(stat -c%s "$img")
+        (( dst_size * 2 > src_size )) || return 1
+    fi
+
+    # 画像が真っ平ら (全透明・単色) なら失敗とみなす
+    if command -v identify &>/dev/null; then
+        local sd
+        sd=$(identify -format '%[fx:standard_deviation]' "$img" 2>/dev/null || true)
+        if [[ -n "$sd" ]] && ! awk -v v="$sd" 'BEGIN { exit !(v > 0.001) }'; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# --- AI超解像 ---
+# 失敗したときは出力ファイルを残さない
+run_upscale() {
+    local src="$1" dst="$2"
+
+    [[ -f "$REALESRGAN_BIN" ]] || return 1
+    rm -f "$dst"
+    if ! "$REALESRGAN_BIN" -i "$src" -o "$dst" -n realesr-animevideov3-x2 -s 2 -f webp \
+        -g "$REALESRGAN_GPU" >/dev/null 2>&1; then
+        rm -f "$dst"
+        return 1
+    fi
+    if ! image_ok "$dst" "$src"; then
+        rm -f "$dst"
+        return 1
+    fi
+    return 0
+}
+
+# --- 壁紙を適用 (GNOME + Hyprland/Ambxst) ---
+# GNOME: gsettings / Hyprland: Ambxst (起動しているときのみ)
+apply_wallpaper() {
+    local img="$1"
+    if [[ ! -f "$img" || ! -s "$img" ]]; then
+        echo "壁紙ファイルが存在しません: $img" >&2
+        return 1
+    fi
+
+    # GNOME (light / dark 両方)
+    if command -v gsettings &>/dev/null; then
+        gsettings set org.gnome.desktop.background picture-uri "file://${img}"
+        gsettings set org.gnome.desktop.background picture-uri-dark "file://${img}"
+    fi
+
+    # Hyprland (Ambxst)
+    # Ambxst の壁紙ディレクトリに安定した名前で置いてから適用する。
+    # (ディレクトリ外のファイルは cli_<timestamp>_... として取り込まれるため)
+    local amx
+    amx=$(command -v ambxst 2>/dev/null || true)
+    [[ -z "$amx" && -x /usr/local/bin/ambxst ]] && amx=/usr/local/bin/ambxst
+    if [[ -n "$amx" ]]; then
+        local wp_dir dst IMG_FOR_AMX
+        IMG_FOR_AMX=""
+        wp_dir=$(jq -r '.wallPath // empty' "${HOME}/.cache/ambxst/wallpapers.json" 2>/dev/null || true)
+        if [[ -n "$wp_dir" && -d "$wp_dir" ]]; then
+            dst="${wp_dir}/genshin-wallpaper.webp"
+            cmp -s "$img" "$dst" || cp -f "$img" "$dst"
+            IMG_FOR_AMX="$dst"
+            # 過去に取り込まれた ad-hoc コピーを掃除
+            find "$wp_dir" -maxdepth 1 \( -name 'cli_*_current_upscaled.webp' -o -name 'cli_*_current.webp' \) -delete 2>/dev/null || true
+        else
+            IMG_FOR_AMX="$img"
+        fi
+        if timeout 30 "$amx" wallpaper "$IMG_FOR_AMX" >/dev/null 2>&1; then
+            echo "Hyprland (Ambxst): 壁紙を適用しました (${IMG_FOR_AMX})"
+        else
+            echo "Hyprland (Ambxst): 適用をスキップ (Ambxst 未起動など)" >&2
+        fi
+    fi
+}
+
+# --- 適用のみ (Hyprland ログイン時の再適用などに使用) ---
+if [[ -n "$APPLY_ONLY" ]]; then
+    TARGET="$CURRENT_UPSCALED"
+    [[ -f "$TARGET" ]] || TARGET="$CURRENT_IMG"
+    if [[ ! -f "$TARGET" ]]; then
+        echo "適用できる壁紙がありません。通常実行してください。" >&2
+        exit 1
+    fi
+    apply_wallpaper "$TARGET"
+    exit $?
+fi
+
 # --- 超解像のみ実行モード ---
 if [[ -n "$UPSCALE_ONLY" ]]; then
     if [[ ! -f "$CURRENT_IMG" ]]; then
@@ -137,17 +248,13 @@ if [[ -n "$UPSCALE_ONLY" ]]; then
         exit 1
     fi
     echo "既存画像の超解像を実行します..."
-    rm -f "$TEMP_UPSCALED"
-    if "$REALESRGAN_BIN" -i "$CURRENT_IMG" -o "$TEMP_UPSCALED" -n realesr-animevideov3-x2 -s 2 -f webp >/dev/null 2>&1; then
-        if [[ -f "$TEMP_UPSCALED" && -s "$TEMP_UPSCALED" ]]; then
-            mv "$TEMP_UPSCALED" "$CURRENT_UPSCALED"
-            sync
-            sleep 2
-            gsettings set org.gnome.desktop.background picture-uri "file://${CURRENT_UPSCALED}"
-            gsettings set org.gnome.desktop.background picture-uri-dark "file://${CURRENT_UPSCALED}"
-            echo "超解像完了。壁紙を更新しました。"
-            exit 0
-        fi
+    if run_upscale "$CURRENT_IMG" "$TEMP_UPSCALED"; then
+        mv "$TEMP_UPSCALED" "$CURRENT_UPSCALED"
+        sync
+        sleep 2
+        apply_wallpaper "$CURRENT_UPSCALED"
+        echo "超解像完了。壁紙を更新しました。"
+        exit 0
     fi
     echo "超解像に失敗しました。" >&2
     exit 1
@@ -187,6 +294,18 @@ else
         if [[ "$CURRENT_HASH" == "$PREV_HASH" ]]; then
             echo "画像に変更はありません"
             rm -f "$TEMP_IMG"
+            # 適用中の超解像画像が壊れていたら作り直す
+            # (Real-ESRGAN が全透明画像を書き出したまま、壁紙が背景色になる事故の復旧)
+            if [[ -f "$CURRENT_UPSCALED" ]] && ! image_ok "$CURRENT_UPSCALED" "$CURRENT_IMG"; then
+                echo "適用中の超解像画像が壊れています。再生成します..." >&2
+                rm -f "$CURRENT_UPSCALED"
+                if run_upscale "$CURRENT_IMG" "$TEMP_UPSCALED"; then
+                    mv "$TEMP_UPSCALED" "$CURRENT_UPSCALED"
+                    apply_wallpaper "$CURRENT_UPSCALED" || true
+                else
+                    apply_wallpaper "$CURRENT_IMG" || true
+                fi
+            fi
             exit 0
         fi
     fi
@@ -202,17 +321,13 @@ echo "$CURRENT_HASH" > "$HASH_FILE"
 USE_UPSCALED=""
 if [[ -n "$NEED_UPSCALE" ]] && [[ -f "$REALESRGAN_BIN" ]]; then
     echo "AI超解像処理中...（数秒〜数十秒かかります）"
-    rm -f "$TEMP_UPSCALED"  # tempだけ消す。current_upscaledは残しておく
-    if "$REALESRGAN_BIN" -i "$CURRENT_IMG" -o "$TEMP_UPSCALED" -n realesr-animevideov3-x2 -s 2 -f webp >/dev/null 2>&1; then
-        if [[ -f "$TEMP_UPSCALED" && -s "$TEMP_UPSCALED" ]]; then
-            mv "$TEMP_UPSCALED" "$CURRENT_UPSCALED"
-            USE_UPSCALED="1"
-            echo "AI超解像完了"
-        fi
-    fi
-    if [[ -z "$USE_UPSCALED" ]]; then
+    # tempだけ消す。current_upscaledは処理中も残しておく
+    if run_upscale "$CURRENT_IMG" "$TEMP_UPSCALED"; then
+        mv "$TEMP_UPSCALED" "$CURRENT_UPSCALED"
+        USE_UPSCALED="1"
+        echo "AI超解像完了"
+    else
         echo "AI超解像に失敗しました。通常の画像を使用します。" >&2
-        rm -f "$TEMP_UPSCALED"
     fi
 fi
 
@@ -223,16 +338,10 @@ else
     WALLPAPER_TARGET="$CURRENT_IMG"
 fi
 
-# --- GNOME壁紙を設定 ---
-if [[ -f "$WALLPAPER_TARGET" && -s "$WALLPAPER_TARGET" ]]; then
-    sync
-    sleep 2
-    gsettings set org.gnome.desktop.background picture-uri "file://${WALLPAPER_TARGET}"
-    gsettings set org.gnome.desktop.background picture-uri-dark "file://${WALLPAPER_TARGET}"
-else
-    echo "壁紙ファイルが存在しません。設定をスキップします。" >&2
-    exit 1
-fi
+# --- 壁紙を適用 (GNOME + Hyprland/Ambxst) ---
+sync
+sleep 2
+apply_wallpaper "$WALLPAPER_TARGET" || exit 1
 
 # ロック画面も設定したい場合は以下のコメントを外す
 # gsettings set org.gnome.desktop.screensaver picture-uri "file://${WALLPAPER_TARGET}"

@@ -51,6 +51,7 @@ systemctl --user enable --now genshin-wallpaper.timer
 genshin-wallpaper.sh               # 通常実行（変更があれば更新）
 genshin-wallpaper.sh -f            # 強制実行（ハッシュ無視・超解像も再実行）
 genshin-wallpaper.sh --upscale-only # 既存の元画像を超解像のみ実行
+genshin-wallpaper.sh --apply-only   # ダウンロード/超解像せず、現在の画像を適用のみ
 ```
 
 手動で即時実行する場合:
@@ -63,6 +64,25 @@ systemctl --user start genshin-wallpaper.service
 
 ```bash
 journalctl --user -u genshin-wallpaper.service -e
+```
+
+## Hyprland / Ambxst 対応
+
+Hyprland（Ambxst シェル）でも壁紙が反映されます。
+
+- GNOME: 従来どおり `gsettings`（`org.gnome.desktop.background`）へ設定
+- Hyprland: `ambxst wallpaper <file>` を呼び、Ambxst の壁紙機構（+テーマ色の再生成）に反映
+  - Ambxst の壁紙ディレクトリ（`~/.cache/ambxst/wallpapers.json` の `wallPath`）に
+    `genshin-wallpaper.webp` という安定した名前でコピーしてから適用します
+    （ディレクトリ外のファイルは `cli_<timestamp>_...` として取り込まれる仕様のため）
+- Ambxst が起動していない場合は静かにスキップします（GNOME 側だけ適用）
+
+Ambxst は壁紙状態を `wallpapers.json` に書き戻さないため、Hyprland ログイン時に
+元の壁紙へ戻ることがあります。それを防ぐため、Hyprland 側のセッション起動フック
+（`~/.config/hypr/hyprland.lua` の OVERRIDES）から 20 秒後に `--apply-only` を実行しています。
+
+```lua
+hl.exec_cmd("sh -c 'sleep 20; for i in $(seq 1 20); do \"$HOME/.local/bin/genshin-wallpaper.sh\" --apply-only >/dev/null 2>&1 && break; sleep 3; done'")
 ```
 
 ## ファイル構成
@@ -88,10 +108,12 @@ systemd/genshin-wallpaper.timer       # 定期実行（ログイン30秒後 + 1�
 
 - **API の言語**: `genshin-wallpaper.sh` の `API_URL` 内 `language=ja-jp` を変更
 - **解像度・モデル**: `-n realesr-animevideov3-x2 -s 2` の部分を変更（他モデルは `realesrgan/models/` 参照）
+- **超解像に使う GPU**: 環境変数 `REALESRGAN_GPU`（既定 `1` = iGPU。`0` = NVIDIA dGPU、`2` = llvmpipe）。
+  dGPU では Vulkan が Xid 109 で失敗し、全透明の WebP が出力されることがあります。
 - **実行間隔**: `systemd/genshin-wallpaper.timer` の `OnUnitActiveSec` を変更
 
 ## 注意
 
-- GNOME 専用です。`gsettings` のキー (`org.gnome.desktop.background`) に依存します。
+- GNOME と Hyprland（Ambxst）に対応しています。GNOME は `gsettings` (`org.gnome.desktop.background`)、Hyprland は `ambxst wallpaper` を使用します。
 - 壁紙の設定先は `~/.local/bin` を前提としています。別の場所に置く場合は `genshin-wallpaper.service` の `ExecStart` を修正してください。
 - API は非公式に利用しています。仕様変更により取得に失敗する可能性があります（その場合は前回の壁紙を維持します）。
